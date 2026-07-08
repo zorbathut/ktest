@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+#
+# Reproducer: keys in a live interior snapshot node that are shadowed
+# (overwritten or deleted) in every live descendant are never reclaimed.
+#
+# When a subvolume is snapshotted, data written beforehand lands in what
+# becomes an interior snapshot node, visible to both children. If the data
+# is then deleted in *every* child, the interior keys are unreachable from
+# any subvolume - but snapshot deletion only reaps keys belonging to dying
+# snapshot IDs, so nothing ever collects them. See the comment block in
+# fs/snapshots/delete.c ("how do keys that have been overwritten in all
+# child snapshots get deleted (unimplemented?)").
+#
+# test_shadowed_key_leak demonstrates the leak: it validates the
+# measurement first (write + delete with no snapshot round-trips to
+# zero), then shows the same write + delete leaks the file's full size
+# when a snapshot exists, even after sysfs triggers, remount and fsck.
+# Expected to FAIL until interior-node key reclamation is implemented.
+#
+# test_shadowed_key_reclaim_on_snap_delete is the control for the
+# reclamation path that does exist: deleting the snapshot makes the
+# interior node redundant, and dead snapshot deletion drops its shadowed
+# keys while moving the rest to the surviving child. Expected to pass.
+
+. $(dirname $(readlink -e "${BASH_SOURCE[0]}"))/bcachefs-test-libs.sh
+
+config-scratch-devs 8G
+
+FILE_MB=100
+SLACK=$((4 << 20))
+
+fs_user_bytes()
+{
+    bcachefs fs usage -f replicas /mnt |
+	awk '$1 == "user:" { n += $NF } END { printf "%d\n", n }'
+}
+
+# Poll until user data accounting drops to <= $1 bytes, up to $2 seconds
+wait_user_below()
+{
+    local want=$1 secs=$2 v i
+
+    for ((i = 0; i < secs; i++)); do
+	v=$(fs_user_bytes)
+	[[ $v -le $want ]] && return 0
+	sleep 1
+    done
+
+    echo "user data still $v bytes (wanted <= $want)"
+    return 1
+}
+
+write_testfile()
+{
+    dd if=/dev/urandom of=/mnt/foo bs=1M count=$FILE_MB oflag=direct
+    sync
+
+    local v=$(fs_user_bytes)
+    if [[ $v -lt $((FILE_MB << 20)) ]]; then
+	echo "expected >= ${FILE_MB}M user data after write, got $v bytes"
+	exit 1
+    fi
+}
+
+test_shadowed_key_leak()
+{
+    set_watchdog 600
+
+    local dev=${ktest_scratch_dev[0]}
+
+    run_quiet "" bcachefs format -f $dev
+    mount -t bcachefs $dev /mnt
+
+    local baseline=$(fs_user_bytes)
+    local want=$((baseline + SLACK))
+
+    # Control: write and delete with no snapshot involved; space must
+    # round-trip to zero, validating the measurement:
+    write_testfile
+    rm /mnt/foo
+    sync
+
+    if ! wait_user_below $want 30; then
+	echo "control failed: space not reclaimed with no snapshots involved"
+	exit 1
+    fi
+
+    # Reproducer: same write and delete, but with a snapshot taken in
+    # between. The file's extents land in what becomes the interior
+    # snapshot node; deleting the file in both children shadows them
+    # from every live snapshot:
+    write_testfile
+    bcachefs subvolume snapshot /mnt /mnt/snap
+
+    rm /mnt/foo /mnt/snap/foo
+    sync
+
+    # The content is now provably unreachable. The snapshot root shares
+    # st_dev+st_ino with /mnt, so find's loop detection stops it from
+    # descending into /mnt/snap - walk each subvolume as its own root:
+    if [[ -n $(find /mnt /mnt/snap -type f 2>/dev/null) ]]; then
+	echo "unexpected reachable files:"
+	find /mnt /mnt/snap -type f 2>/dev/null
+	exit 1
+    fi
+
+    # Give every reclamation mechanism a chance before declaring a leak:
+    if ! wait_user_below $want 30; then
+	echo 1 | tee /sys/fs/bcachefs/*/internal/trigger_delete_dead_snapshots > /dev/null
+	echo 1 | tee /sys/fs/bcachefs/*/internal/trigger_gc > /dev/null
+
+	if ! wait_user_below $want 30; then
+	    umount /mnt
+	    bcachefs fsck -y $dev
+	    mount -t bcachefs $dev /mnt
+
+	    if ! wait_user_below $want 60; then
+		local leaked=$(($(fs_user_bytes) - baseline))
+
+		echo
+		echo "LEAK: $leaked bytes of user data unreachable from any subvolume,"
+		echo "not reclaimed by snapshot deletion, gc, remount or fsck"
+		echo
+		bcachefs fs usage -a -h /mnt
+		cat /sys/fs/bcachefs/*/snapshot_delete_status
+		exit 1
+	    fi
+	fi
+    fi
+
+    umount /mnt
+
+    bcachefs_test_end_checks $dev
+}
+
+test_shadowed_key_reclaim_on_snap_delete()
+{
+    set_watchdog 600
+
+    local dev=${ktest_scratch_dev[0]}
+
+    run_quiet "" bcachefs format -f $dev
+    mount -t bcachefs $dev /mnt
+
+    local baseline=$(fs_user_bytes)
+    local want=$((baseline + SLACK))
+
+    write_testfile
+    bcachefs subvolume snapshot /mnt /mnt/snap
+
+    rm /mnt/foo /mnt/snap/foo
+    sync
+
+    # Deleting the snapshot leaves the interior node with one live child,
+    # making it redundant: dead snapshot deletion moves its keys to the
+    # surviving child, dropping the shadowed ones. This path exists today
+    # and must reclaim the space:
+    bcachefs subvolume delete /mnt/snap
+
+    # Subvolume deletion finishes asynchronously (pagecache wait), so keep
+    # poking the deletion worker until the space comes back:
+    local i
+    for ((i = 0; i < 60; i++)); do
+	echo 1 | tee /sys/fs/bcachefs/*/internal/trigger_delete_dead_snapshots > /dev/null
+	[[ $(fs_user_bytes) -le $want ]] && break
+	sleep 1
+    done
+
+    if ! wait_user_below $want 1; then
+	echo "space not reclaimed after snapshot deletion"
+	echo
+	bcachefs fs usage -a -h /mnt
+	cat /sys/fs/bcachefs/*/snapshot_delete_status
+	exit 1
+    fi
+
+    umount /mnt
+
+    bcachefs_test_end_checks $dev
+}
+
+main "$@"
