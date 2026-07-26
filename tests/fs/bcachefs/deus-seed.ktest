@@ -1,0 +1,465 @@
+#!/bin/bash
+#
+# THROWAWAY EXPERIMENT (not for check-in): where does the deus damage start?
+#
+# Hypothesis under test: the seed for the deus corruption - an inode version
+# missing at a snapshot id where that inum's content survives - is produced at
+# runtime by __bch2_inode_rm_snapshot(), which deletes an inode version's
+# extents/dirents/xattrs with the return values DISCARDED and then deletes the
+# inode key with a checked commit. bch2_btree_delete_range_trans() commits
+# internally and can return a real error (ENOMEM under memory pressure, EIO,
+# ENOSPC on the reservation), so one transient failure there strands content
+# while the inode version goes away. No crash required.
+#
+# Requires the fault-injection hack in fs/fs/inode.c:
+#   /sys/module/bcachefs/parameters/inode_rm_fail_content (1=extents 2=dirents 4=xattrs)
+#
+# Two shapes are driven here:
+#   seed_via_ancestor_walk - unlink-while-open + snapshot + close, so
+#     bch2_inode_rm()'s delete_ancestor_snapshot_inodes() walk reaps the
+#     OLDER snapshot's version through the unchecked path
+#   seed_via_recovery_reaper - the same inode left in the deleted_inodes
+#     btree, reaped by the delete_dead_inodes recovery pass at mount
+#
+# Then: does that seed feed the known runtime-deletion stranding (dead
+# check_no_data guard) all the way to data loss?
+
+. $(dirname $(readlink -e "${BASH_SOURCE[0]}"))/bcachefs-test-libs.sh
+
+config-scratch-devs 16G
+
+INJ=/sys/module/bcachefs/parameters/inode_rm_fail_content
+
+kvdb()
+{
+    bcachefs kvdb ${ktest_scratch_dev[0]} "$@"
+}
+
+require_inject()
+{
+    [[ -f $INJ ]] || {
+	echo "SKIP: no inode_rm_fail_content knob - build fs/ with the hack branch"
+	exit 0
+    }
+}
+
+arm()	{ echo "$1" > $INJ; }
+disarm(){ echo 0 > $INJ; }
+
+# All inode/content keys for $1 (inum), every snapshot, as "btree type snapshot".
+# Inode keys are 0:inum:snap; extent/dirent/xattr keys are inum:offset:snap.
+# kvdb renders snapshot 4294967295 as U32_MAX - normalize it, or the stranded
+# keys at the root/interior id are invisible to this report.
+keys_for_inum()
+{
+    local inum=$1 b
+    { kvdb -c "list inodes"  || true; } | sed 's/U32_MAX/4294967295/g' |
+	sed -n "s/.*type \([a-z_0-9]*\) 0:$inum:\([0-9]*\) .*/inodes \1 \2/p"
+    for b in extents dirents xattrs; do
+	{ kvdb -c "list $b" || true; } | sed 's/U32_MAX/4294967295/g' |
+	    sed -n "s/.*type \([a-z_0-9]*\) $inum:[0-9]*:\([0-9]*\) .*/$b \1 \2/p"
+    done
+}
+
+# A key that actually holds something (whiteouts and deleted slots are absence)
+real_key_re='^[a-z]+ (inode_v[0-9]+|extent|inline_data|dirent|xattr) '
+
+report_shape()		# $1: inum, $2: label
+{
+    echo ":: key shape for inum $1 ($2)  [btree type snapshot]"
+    keys_for_inum "$1" > /tmp/shape.$$
+    sort /tmp/shape.$$ | uniq -c | sed 's/^/    /' || true
+    [[ -s /tmp/shape.$$ ]] || echo "    (no keys at all)"
+    rm -f /tmp/shape.$$
+}
+
+# The seed: a snapshot id holding REAL content for $1 with no inode version
+# there (whiteouts on both sides are absence, not presence)
+seed_ids()		# $1: inum
+{
+    local inum=$1
+    keys_for_inum "$inum" | grep -E "$real_key_re" > /tmp/keys.$$ || true
+    awk '$1=="inodes" {print $3}' /tmp/keys.$$ | sort -u > /tmp/i.$$
+    awk '$1!="inodes" {print $3}' /tmp/keys.$$ | sort -u > /tmp/c.$$
+    comm -13 /tmp/i.$$ /tmp/c.$$
+    rm -f /tmp/keys.$$ /tmp/i.$$ /tmp/c.$$
+}
+
+# ── shape 1: the ancestor-snapshot walk from a live unlink ────────────────
+#
+# unlink while open -> snapshot (freezes an unlinked-but-open version) ->
+# close. Eviction runs bch2_inode_rm() on the live version (which DOES check
+# its deletes), then delete_ancestor_snapshot_inodes() walks into the
+# snapshot's version and reaps it through __bch2_inode_rm_snapshot() - the
+# unchecked path, at an id whose content is still live for that snapshot.
+test_seed_via_ancestor_walk()
+{
+    require_inject
+
+    run_quiet "" bcachefs format -f ${ktest_scratch_dev[0]}
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+
+    mkdir /mnt/dir
+    dd if=/dev/urandom of=/mnt/dir/victim bs=4k count=64 status=none
+    sync
+    local inum=$(stat -c %i /mnt/dir/victim)
+    echo "victim inum $inum"
+
+    exec 9< /mnt/dir/victim		# hold it open
+    rm /mnt/dir/victim			# unlinked, but still open
+    bcachefs subvolume snapshot /mnt/snap-0
+    sync
+
+    # keep it armed across the umount too: eviction may be deferred, and the
+    # delete_dead_inodes pass can run at unmount/next mount instead of close
+    arm 1				# fail the extents delete
+    exec 9<&-				# close -> evict -> reaper
+    sync
+    sleep 2				# let async eviction land
+    umount /mnt
+    disarm
+
+    report_shape "$inum" "after injected unlink"
+    local seeds=$(seed_ids "$inum")
+    if [[ -n $seeds ]]; then
+	echo "SEED CREATED: content for inum $inum at snapshot id(s) with no inode version:"
+	echo "$seeds" | sed 's/^/    /'
+    else
+	echo "no seed: every snapshot with content still has an inode version"
+    fi
+
+    echo ":: fsck -n verdict"
+    bcachefs fsck -n ${ktest_scratch_dev[0]} 2>&1 | tail -30 || true
+
+    # with the try() fix: the failed attempt must leave the inode key in
+    # place, and a disarmed mount cycle must complete the removal
+    echo ":: retry with injection disarmed (fix validation)"
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+    sync
+    umount /mnt
+    report_shape "$inum" "after disarmed retry"
+    if [[ -z $(keys_for_inum "$inum" | grep -E "$real_key_re") ]]; then
+	echo "RETRY COMPLETED: all keys for the inum gone (removal finished cleanly)"
+    else
+	echo "retry did not finish the removal (see shape above)"
+    fi
+}
+
+# ── shape 2: the recovery reaper ──────────────────────────────────────────
+#
+# Same unlinked-in-a-snapshot inode, but left for the delete_dead_inodes
+# recovery pass: arm before the mount that runs it. Deterministic - no
+# eviction race.
+test_seed_via_recovery_reaper()
+{
+    require_inject
+
+    run_quiet "" bcachefs format -f ${ktest_scratch_dev[0]}
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+
+    mkdir /mnt/dir
+    dd if=/dev/urandom of=/mnt/dir/victim bs=4k count=64 status=none
+    sync
+    local inum=$(stat -c %i /mnt/dir/victim)
+    echo "victim inum $inum"
+
+    exec 9< /mnt/dir/victim
+    rm /mnt/dir/victim
+    bcachefs subvolume snapshot /mnt/snap-0
+    sync
+    exec 9<&-
+    sync
+    umount /mnt
+
+    report_shape "$inum" "before the reaper"
+
+    echo ":: deleted_inodes btree"
+    kvdb -c "list deleted_inodes" || true
+
+    arm 1
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+    sync
+    umount /mnt
+    disarm
+
+    report_shape "$inum" "after the reaper ran with injection armed"
+    local seeds=$(seed_ids "$inum")
+    if [[ -n $seeds ]]; then
+	echo "SEED CREATED: content at snapshot id(s) with no inode version:"
+	echo "$seeds" | sed 's/^/    /'
+    else
+	echo "no seed"
+    fi
+
+    echo ":: fsck -n verdict"
+    bcachefs fsck -n ${ktest_scratch_dev[0]} 2>&1 | tail -30 || true
+}
+
+# ── the full chain: seed -> runtime snapshot deletion -> data loss ────────
+#
+# Make the seed with a real unlink, then make that id redundant by deleting a
+# snapshot, and see whether the (inode-gated) sweep strands the survivors and
+# the dead check_no_data guard licenses no_keys - i.e. the deus chain, start
+# to finish, with no kvdb surgery anywhere.
+test_seed_to_data_loss()
+{
+    require_inject
+
+    run_quiet "" bcachefs format -f ${ktest_scratch_dev[0]}
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+
+    mkdir /mnt/dir
+    echo keepme > /mnt/dir/keeper
+    dd if=/dev/urandom of=/mnt/dir/victim bs=4k count=64 status=none
+    sync
+    local inum=$(stat -c %i /mnt/dir/victim)
+
+    exec 9< /mnt/dir/victim
+    rm /mnt/dir/victim
+    bcachefs subvolume snapshot /mnt/snap-0		# freezes the unlinked version
+    sync
+
+    # arm BEFORE the close: eviction runs the ancestor walk right there, so
+    # arming after it (or only around a later mount) misses the reaping
+    # entirely - the recovery pass then has nothing left to do
+    arm 1
+    exec 9<&-
+    sync
+    sleep 2
+    umount /mnt
+    disarm
+
+    report_shape "$inum" "seeded"
+    local seeds=$(seed_ids "$inum")
+    [[ -n $seeds ]] || { echo "no seed created - nothing to chain"; return 0; }
+    echo "seed at snapshot id(s): $seeds"
+
+    # make more snapshots so the seeded id can become a redundant interior
+    # node, then delete one and run the deletion worker
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+    bcachefs subvolume snapshot /mnt/snap-1
+    sync
+    bcachefs subvolume delete /mnt/snap-0
+    sync
+    echo 1 | tee /sys/fs/bcachefs/*/internal/trigger_delete_dead_snapshots >& /dev/null || true
+    sync
+    umount /mnt
+
+    echo ":: snapshots after deletion"
+    bcachefs list -b snapshots ${ktest_scratch_dev[0]} || true
+
+    report_shape "$inum" "after runtime snapshot deletion"
+
+    # settle any splice on its own mount cycle (stale is_ancestor bitmaps)
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+    umount /mnt
+
+    echo ":: fsck -n verdict (does it see stranded keys / missing inodes?)"
+    bcachefs fsck -n ${ktest_scratch_dev[0]} 2>&1 | tail -40 || true
+
+    echo ":: fsck -y (does the stranded content resurrect as a reconstructed inode?)"
+    bcachefs fsck -y ${ktest_scratch_dev[0]} 2>&1 | tail -40 || true
+
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+    echo ":: surviving tree"
+    ls -la /mnt/dir /mnt/snap-1/dir 2>&1 | sed 's/^/    /'
+    echo ":: lost+found (deus's 2315 'contents found: reconstructing' land here)"
+    ls -la /mnt/lost+found /mnt/snap-1/lost+found 2>&1 | sed 's/^/    /'
+    umount /mnt
+}
+
+# ── does the seed become VISIBLE damage, and does it walk? ───────────────
+#
+# The chain test deleted snap-0, so the orphaned extents were covered by
+# main's whiteouts and got quietly reaped. Keep the snapshot instead: its
+# view inherits the seeded id directly, with no whiteout in the way, so the
+# orphaned content is live-visible content belonging to no inode - which is
+# what fsck reconstructs into lost+found. That is deus's single largest
+# damage class (2315 "inode missing, but contents found: reconstructing").
+#
+# Then rotate snapshots the way a real server does and see whether the
+# damage moves (the walk).
+test_seed_visible_damage()
+{
+    require_inject
+
+    run_quiet "" bcachefs format -f ${ktest_scratch_dev[0]}
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+
+    mkdir /mnt/dir
+    echo keepme > /mnt/dir/keeper
+    dd if=/dev/urandom of=/mnt/dir/victim bs=4k count=64 status=none
+    sync
+    local inum=$(stat -c %i /mnt/dir/victim)
+    echo "victim inum $inum"
+
+    exec 9< /mnt/dir/victim
+    rm /mnt/dir/victim			# unlinked but open, at the id snap-0 will inherit
+    bcachefs subvolume snapshot /mnt/snap-0
+    sync
+
+    arm 1
+    exec 9<&-				# ancestor walk reaps the shared version
+    sync
+    sleep 2
+    umount /mnt
+    disarm
+
+    report_shape "$inum" "seeded, snapshot retained"
+    echo "seed at snapshot id(s): $(seed_ids "$inum" | tr '\n' ' ')"
+
+    echo ":: fsck -y - orphaned content visible to snap-0 with no inode"
+    bcachefs fsck -y ${ktest_scratch_dev[0]} 2>&1 |
+	grep -viE "^ *(check_|delete_dead|resume_logged|journal|going|flushing|clean shutdown|shutting|scanning)" |
+	tail -25 || true
+
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+    echo ":: lost+found after repair"
+    ls -la /mnt/lost+found /mnt/snap-0/lost+found 2>&1 | sed 's/^/    /' || true
+    echo ":: dir contents"
+    ls -la /mnt/dir /mnt/snap-0/dir 2>&1 | sed 's/^/    /' || true
+
+    # rotate: another snapshot, delete the old one - the server workload
+    bcachefs subvolume snapshot /mnt/snap-1
+    sync
+    bcachefs subvolume delete /mnt/snap-0
+    sync
+    echo 1 | tee /sys/fs/bcachefs/*/internal/trigger_delete_dead_snapshots >& /dev/null || true
+    sync
+    umount /mnt
+
+    report_shape "$inum" "after a rotation cycle"
+
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+    umount /mnt
+
+    echo ":: fsck -n after the rotation"
+    bcachefs fsck -n ${ktest_scratch_dev[0]} 2>&1 |
+	grep -viE "^ *(check_|delete_dead|resume_logged|journal|going|flushing|clean shutdown|shutting|scanning)" |
+	tail -25 || true
+
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+    echo ":: final tree"
+    ls -la /mnt/dir /mnt/snap-1/dir /mnt/lost+found /mnt/snap-1/lost+found 2>&1 | sed 's/^/    /' || true
+    umount /mnt
+}
+
+# ── can a LIVE DIRENT be stranded? (the walks shape) ─────────────────────
+#
+# Stranded dirents are the damage class that makes live subtrees vanish -
+# deus had 425 of them against 48.2M extents. A dirent can only be stranded
+# by this hook if the reaped inode is a DIRECTORY that still has entries.
+#
+# Route 1: a directory carrying BCH_INODE_unlinked while non-empty. Current
+# check_inode() has a guard (inode_dir_unlinked_but_not_empty, 915cd4b25,
+# 2024-09) that strips the flag instead - unless the directory is a
+# subvolume root, which is legitimately unlinked-and-non-empty. This test
+# hand-sets the flag (the one artificial step: it stands in for fsck
+# misjudging a directory) and asks which happens: strip, or reap.
+test_fsck_dir_unlinked_flag()
+{
+    require_inject
+
+    run_quiet "" bcachefs format -f ${ktest_scratch_dev[0]}
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+
+    mkdir /mnt/dir
+    echo a > /mnt/dir/a
+    echo b > /mnt/dir/b
+    sync
+    local dir_inum=$(stat -c %i /mnt/dir)
+    echo "dir inum $dir_inum"
+
+    bcachefs subvolume snapshot /mnt/snap-0	# dir + its dirents become shared
+    sync
+    umount /mnt
+
+    local victim=4294967295			# the now-interior id holding them
+    local flags=$(bcachefs kvdb --rw ${ktest_scratch_dev[0]} \
+		      -c "get inodes 0:$dir_inum:$victim bi_flags" | tail -1)
+    echo "dir bi_flags at $victim: $flags"
+    bcachefs kvdb --rw ${ktest_scratch_dev[0]} \
+	-c "update inodes 0:$dir_inum:$victim bi_flags=$(( flags | 128 ))"
+
+    echo ":: dirents at $victim before fsck"
+    kvdb -c "list dirents" | grep -E "^u64s.*$dir_inum:" | sed 's/^/    /' || true
+
+    # kernel-side fsck, so the module param applies (userspace `bcachefs
+    # fsck` links the same code but module params are a no-op there)
+    arm 2
+    mount -t bcachefs -o noatime,fsck,fix_errors=yes ${ktest_scratch_dev[0]} /mnt
+    sync
+    umount /mnt
+    disarm
+
+    echo ":: dirents at $victim after fsck"
+    kvdb -c "list dirents" | grep -E "^u64s.*$dir_inum:" | sed 's/^/    /' || true
+    report_shape "$dir_inum" "dir, after fsck with dirent-delete injected"
+
+    local flags2=$(bcachefs kvdb ${ktest_scratch_dev[0]} \
+		       -c "get inodes 0:$dir_inum:$victim bi_flags" 2>/dev/null | tail -1)
+    if [[ $flags2 =~ ^[0-9]+$ ]] && (( (flags2 & 128) == 0 )); then
+	echo "RESULT: fsck STRIPPED the unlinked flag (guard held) - no reap, no stranding"
+    elif [[ -n $(seed_ids "$dir_inum") ]]; then
+	echo "RESULT: fsck REAPED the directory - live dirents stranded at $(seed_ids "$dir_inum" | tr '\n' ' ')"
+    else
+	echo "RESULT: neither - inspect the shape above"
+    fi
+}
+
+# Route 2: the ancestor walk has NO subvolume-root check, and a deleted
+# subvolume's root directory is unlinked *and* legitimately non-empty (the
+# snapshot sweep is what empties it). If an unlink in a descendant walks
+# into such a version, __bch2_inode_rm_snapshot() deletes a live-ish
+# directory's dirents through the unchecked path. Arm dirents+xattrs across
+# a rotation workload and see whether any directory takes an INJECT hit.
+test_subvol_root_dirents()
+{
+    require_inject
+
+    run_quiet "" bcachefs format -f ${ktest_scratch_dev[0]}
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+
+    mkdir /mnt/dir
+    echo a > /mnt/dir/a
+    dd if=/dev/urandom of=/mnt/dir/big bs=4k count=32 status=none
+    sync
+    local dir_inum=$(stat -c %i /mnt/dir)
+    echo "dir inum $dir_inum"
+
+    bcachefs subvolume snapshot /mnt/snap-0
+    sync
+
+    # an unlink with an ancestor version to walk into, concurrent with the
+    # subvolume deletion that makes snap-0's root unlinked-and-non-empty
+    exec 9< /mnt/dir/big
+    rm /mnt/dir/big
+    bcachefs subvolume snapshot /mnt/snap-1
+    sync
+
+    arm 6				# dirents | xattrs
+    bcachefs subvolume delete /mnt/snap-0
+    sync
+    exec 9<&-
+    sync
+    echo 1 | tee /sys/fs/bcachefs/*/internal/trigger_delete_dead_snapshots >& /dev/null || true
+    sync
+    sleep 2
+    umount /mnt
+    disarm
+
+    echo ":: any dirents stranded (dirent keys whose directory has no inode there)?"
+    report_shape "$dir_inum" "dir after the rotation"
+
+    echo ":: fsck -n"
+    bcachefs fsck -n ${ktest_scratch_dev[0]} 2>&1 |
+	grep -viE "^ *(check_[a-z_]*\.\.\.|delete_dead|resume_logged|journal|going|flushing|clean shutdown|shutting|scanning)" |
+	tail -25 || true
+
+    mount -t bcachefs -o noatime ${ktest_scratch_dev[0]} /mnt
+    echo ":: tree"
+    ls -la /mnt/dir /mnt/snap-1/dir 2>&1 | sed 's/^/    /' || true
+    umount /mnt
+}
+
+main "$@"
